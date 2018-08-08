@@ -7,6 +7,44 @@ import png
 import cp437
 from cp437 import ansi
 
+class VT100Palette(object):
+    PALETTE = None
+
+    def __init__(self, palette=None, nfo=False):
+        self.palette = palette or self.PALETTE
+        self.nfo = nfo
+
+        if self.palette is None:
+            self.palette = dict()
+
+        if not isinstance(self.palette, dict):
+            raise ValueError('palette must be a dictionary object')
+
+        self.depth = 2 if self.nfo else 16
+
+        if self.depth == 2:
+            self.palette[0] = palette.get(0, ansi.colors[0])
+            self.palette[1] = palette.get(1, ansi.colors[7])
+        else:
+            for i in xrange(self.depth):
+                self.palette[i] = palette.get(i, ansi.colors[i])
+
+    def get(self, index):
+        if not 0 <= index < self.depth:
+            raise ValueError('color index out of range')
+
+        return self.palette[index]
+
+    def find(self, r, g=None, b=None):
+        if isinstance(r, list) or isinstance(r, tuple):
+            r, g, b = r
+
+        t = (r,g,b)
+        reverse_dict = dict(map(lambda x: x[::-1], self.palette.items()))
+
+        if not t in reverse_dict:
+            raise ValueError('color pairing {} not found'.format(t))
+
 class VT100Block(object):
     BACKGROUND = 0
     FOREGROUND = 0
@@ -62,10 +100,42 @@ class VT100Block(object):
         return '<VT100Block: character:{}/background:{}/foreground:{}>'.format(self.c, self.bg, self.fg)
 
 class VT100Screen(object):
-    def __init__(self, width, height, linebuffer):
-        self.width = width
-        self.height = height
-        self.linebuffer = linebuffer
+    SPACING_9PX = True
+    SPACING_8PX = False
+    WIDTH = 80
+    HEIGHT = 24
+    LINEBUFFER = 4096
+    SPACING = True
+    NFO = False
+    PALETTE = None
+
+    def __init__(self, *args, **kwargs):
+        self.width = kwargs.setdefault('width', self.WIDTH)
+        self.height = kwargs.setdefault('height', self.HEIGHT)
+        self.linebuffer = kwargs.setdefault('linebuffer', self.LINEBUFFER)
+        self.spacing = 9 if kwargs.setdefault('spacing', self.SPACING) else 8
+        self.nfo = kwargs.setdefault('nfo', self.NFO)
+        self.palette = kwargs.setdefault('palette', self.PALETTE)
+
+        if self.palette is None:
+            self.palette = dict(map(lambda x: tuple(x[:]), ansi.colors.items()[:]))
+
+        if self.nfo:
+            indecies = range(2)
+        else:
+            indecies = range(16)
+
+        for k in indecies:
+            if not k in self.palette:
+                raise ValueError('index must include all values 0-15 inclusive (0 or 1 in NFO mode)')
+
+            if not len(self.palette[k]) == 3:
+                raise ValueError('palette entry must be a triplet of values')
+
+            for c in self.palette[k]:
+                if not 0 <= c < 256:
+                    raise ValueError('RGB value must be a number between 0-255 inclusive')
+
         self.drawbuffer = dict()
         self.scroll = 0
         self.vX = 0 # viewing window
@@ -149,7 +219,7 @@ class VT100Screen(object):
         colors = ansi.colors.items()
         colors.sort(lambda x,y: cmp(x[0],y[0]))
         colors = map(lambda x: x[1], colors)
-        output = png.Writer(width=self.width*9
+        output = png.Writer(width=self.width*self.spacing
                             ,height=end*16
                             ,alpha=False # TODO: custom backgrounds for presence of no characters
                             ,background=ansi.colors[0]
@@ -178,14 +248,10 @@ class VT100Screen(object):
                     current_color['fg'] = block.fg
                     current_color['bg'] = block.bg
 
-                if col >= 20 and col <= 27:
-                    if row == 12:
-                        print '({},{})'.format(col+1, row+1), repr(block)
-
                 pixel_map = ansi.charset[block.c]
 
                 for y in xrange(16):
-                    for x in xrange(9):
+                    for x in xrange(self.spacing):
                         pix = pixel_map[y][x]
                         color = ('bg', 'fg')[pixel_map[y][x]]
                         pixel = ansi.colors[current_color[color]]
