@@ -1,0 +1,122 @@
+#!/usr/bin/env python
+
+import argparse
+import os
+import re
+import sys
+
+import cp437
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Perform a variety of actions on files encoded with codepage 437.')
+
+    parser.add_argument('-f', '--file',
+                        type=str,
+                        default='-',
+                        help='CP437-encoded file to parse.')
+    parser.add_argument('-x', '--width',
+                        type=int,
+                        default=80,
+                        help='Width of the draw and view buffer in characters.')
+    parser.add_argument('-y', '--height',
+                        type=int,
+                        default=24,
+                        help='Height of the view buffer in characters.')
+    parser.add_argument('-l', '--line-buffer',
+                        type=int,
+                        default=4096,
+                        help='Lines allotted before data becomes discarded.')
+    parser.add_argument('-n', '--nfo',
+                        action='store_true',
+                        help='Parse the file as if it were an NFO.')
+    parser.add_argument('-p', '--png',
+                        type=str,
+                        help='Export input to PNG file.')
+    parser.add_argument('-9', '--nine-pixels',
+                        action='store_true',
+                        help='Use 9px fonts instead of 8px when rendering to PNG.')
+    parser.add_argument('-c', '--characters',
+                        action='store_true',
+                        help="Don't render vt100 color codes when rendering as text.")
+    parser.add_argument('-a', '--ascii',
+                        action='store_false',
+                        help='Render cp437 as ASCII instead of UTF8.')
+    parser.add_argument('-i', '--irc',
+                        action='store_true',
+                        help='Convert IRC escape sequences to VT100 color sequences.')
+    parser.add_argument('-d', '--debug',
+                        type=str,
+                        default='none',
+                        help='Enable debugging, levels are "none", "info," "event" and "state."')
+
+    # parser.add_argument('-c', '--colors')
+                        
+    args = parser.parse_args(sys.argv[1:])
+    args.debug = args.debug.lower()
+    debug_keys = {'none': cp437.DEBUG_NONE,
+                  'info': cp437.DEBUG_INFO,
+                  'event': cp437.DEBUG_EVENT,
+                  'state': cp437.DEBUG_STATE}
+
+    if not args.debug in ('none', 'info', 'event', 'state'):
+        raise ValueError('debug levels are none, info, event and state, not {}'.format(args.debug))
+
+    cp437.debug_level(debug_keys[args.debug])
+
+    if args.file == '-':
+        # we need to reopen stdin tho
+        sys.stdin = os.fdopen(sys.stdin.fileno(), 'rb', 0)
+        args.file = sys.stdin
+    else:
+        args.file = open(args.file, 'rb')
+        
+    cp437.debug_info('reading input...')
+    stream = args.file.read()
+
+    cp437.debug_info('got {} bytes', len(stream))
+
+    if args.irc:
+        cp437.debug_info('stream contains IRC escape sequences, converting...')
+        codes = re.findall('(\x03([0-9]{1,2}),([0-9]{1,2}))', stream)
+        codes = list(set(codes))
+
+        cp437.debug_info('found {} unique sequences', len(codes))
+
+        for code in codes:
+            summed, fg, bg = code
+            fg = cp437.ansi.irc[int(fg)]
+            bg = cp437.ansi.irc[int(bg)]
+            bright = 1 if fg > 7 else 0
+
+            fg = (fg - 8) if fg > 7 else fg
+            bg = (bg - 8) if bg > 7 else bg
+
+            stream = stream.replace(summed, '\x1b[{};3{};4{}m'.format(bright, fg, bg))
+
+        cp437.debug_info('stream is now {} bytes', len(stream))
+        
+    vt100_parser = cp437.vt100.VT100Parser(stream=stream)
+    vt100_screen = cp437.vt100.VT100Screen(width=args.width,
+                                           height=args.height,
+                                           linebuffer=args.line_buffer,
+                                           spacing=args.nine_pixels,
+                                           nfo=args.nfo)
+
+    cp437.debug_info('parsing file...')
+
+    vt100_parser.parse(vt100_screen)
+
+    cp437.debug_info('parsed!')
+
+    if args.png:
+        cp437.debug_info('converting screen into a PNG file...')
+        vt100_screen.dump_png(args.png)
+    else:
+        cp437.debug_info('dumping rendering to stdout...')
+
+        dumped = vt100_screen.dump_str(not args.characters, args.ascii)
+
+        if not sys.stdout.encoding: # redirecting to a file
+            dumped = bytearray(dumped, 'utf8')
+
+        print dumped

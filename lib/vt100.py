@@ -29,7 +29,13 @@ class VT100Palette(object):
             for i in xrange(self.depth):
                 self.palette[i] = palette.get(i, ansi.colors[i])
 
-    def get(self, index):
+    def has(self, index):
+        return index in self.palette
+
+    def get(self, index): 
+        if index > 1 and self.nfo:
+            index = 1
+
         if not 0 <= index < self.depth:
             raise ValueError('color index out of range')
 
@@ -43,7 +49,9 @@ class VT100Palette(object):
         reverse_dict = dict(map(lambda x: x[::-1], self.palette.items()))
 
         if not t in reverse_dict:
-            raise ValueError('color pairing {} not found'.format(t))
+            raise ValueError('color triad {} not found'.format(t))
+
+        return reverse_dict[t]
 
 class VT100Block(object):
     BACKGROUND = 0
@@ -85,14 +93,6 @@ class VT100Block(object):
     def c(self):
         return self.character
 
-    @property
-    def bg_color(self):
-        return ansi.colors[self.bg]
-
-    @property
-    def fg_color(self):
-        return ansi.colors[self.fg]
-
     def __str__(self):
         return chr(self.c)
 
@@ -114,25 +114,24 @@ class VT100Screen(object):
         self.height = kwargs.setdefault('height', self.HEIGHT)
         self.linebuffer = kwargs.setdefault('linebuffer', self.LINEBUFFER)
         self.spacing = 9 if kwargs.setdefault('spacing', self.SPACING) else 8
-        self.nfo = kwargs.setdefault('nfo', self.NFO)
         self.palette = kwargs.setdefault('palette', self.PALETTE)
 
         if self.palette is None:
-            self.palette = dict(map(lambda x: tuple(x[:]), ansi.colors.items()[:]))
+            self.palette = VT100Palette(dict(map(lambda x: tuple(x[:]), ansi.colors.items()[:])))
 
-        if self.nfo:
+        if self.palette.nfo:
             indecies = range(2)
         else:
             indecies = range(16)
 
         for k in indecies:
-            if not k in self.palette:
+            if not self.palette.has(k):
                 raise ValueError('index must include all values 0-15 inclusive (0 or 1 in NFO mode)')
 
-            if not len(self.palette[k]) == 3:
+            if not len(self.palette.get(k)) == 3:
                 raise ValueError('palette entry must be a triplet of values')
 
-            for c in self.palette[k]:
+            for c in self.palette.get(k):
                 if not 0 <= c < 256:
                     raise ValueError('RGB value must be a number between 0-255 inclusive')
 
@@ -145,29 +144,54 @@ class VT100Screen(object):
 
         self.reset_attributes()
 
+    def check_eol(self):
+        if self.dX < self.width:
+            return
+
+        self.dX = 0
+        self.dY += 1
+
+        self.check_linebuffer()
+
+    def check_linebuffer(self):
+        if self.dY < self.linebuffer:
+            return
+
+        scroll = self.dY - self.linebuffer
+        self.delete_rows(self.scroll,scroll+1)
+        self.scroll = scroll
+
     def draw(self, c):
+        cp437.debug_state('drawing onto screen')
+
+        if self.palette.nfo:
+            self.bg = 0
+            self.fg = 1
+            self.bright = 0
+
         if self.bright and self.fg < 8:
             self.fg += 8
 
         block = VT100Block(c=c, bg=self.bg, fg=self.fg)
 
-        if self.dX >= self.width:
-            self.dX = 0
-            self.dY += 1
-
-            if self.dY >= self.linebuffer:
-                scroll = self.dY - self.linebuffer
-                self.delete_rows(self.scroll,scroll+1)
-                self.scroll = scroll
+        cp437.debug_state('screen state> dX: {} / dY: {} / block: {}', self.dX, self.dY, repr(block))
 
         if c == 0xA: # newline
-            self.dY += 1
-        elif c == 0xD: # carriage return
             self.dX = 0
+            self.dY += 1
+            self.check_linebuffer()
+        elif c == 0xD: # carriage return
+            pass
         else:
+            self.check_eol()
+
             row = self.drawbuffer.setdefault(self.dY, dict())
             row[self.dX] = block
             self.dX += 1
+
+            self.check_eol()
+
+        cp437.debug_state('screen state< dX: {} / dY: {}', self.dX, self.dY)
 
     def delete_rows(self, d_from, d_to):
         for i in range(d_from,d_to):
@@ -175,41 +199,84 @@ class VT100Screen(object):
                 del self.drawbuffer[i]
 
     def reset_attributes(self):
+        cp437.debug_state('resetting attributes')
+
         self.bg = 0
-        self.fg = 7
+        self.fg = 7 if not self.palette.nfo else 1
         self.bright = False
         self.underscore = False
         self.blink = False
         self.reverse = False
         self.hidden = False
 
-    def dump_str(self):
-        end = self.dY + 1
+    def dump_str(self, colors=False, utf8=False):
+        end = self.dY+1
         result = list()
+        current_color = {'fg': 7, 'bg': 0, 'bright': False}
 
         for row in xrange(end):
             if not row in self.drawbuffer:
-                result.append('\n')
+                if not row+1 == end:
+                    result.append(' '*self.width)
+                    result.append('\n')
+
                 continue
 
             last_col = 0
 
             for col in xrange(self.width):
-                if not col in self.drawbuffer[row]:
-                    continue
-
                 delta = col - last_col
                 last_col = col
 
-                if delta > 1:
-                    delta -= 1
-                    result.append(' '*delta)
+                if not col in self.drawbuffer[row]:
+                    block = VT100Block(bg=0,fg=7,c=0)
+                else:
+                    block = self.drawbuffer[row][col]
 
-                block = self.drawbuffer[row][col]
-                result.append(chr(block.c))
+                codes = list()
 
-            if not last_col == self.width-1:
-                result.append('\n')
+                if colors:
+                    block_color = {'fg': block.fg, 'bg': block.bg, 'bright': block.fg > 7}
+
+                    if not block_color == current_color:
+                        result.append('\x1b[')
+                        reset = False
+
+                        if not block_color['bright'] == current_color['bright']:
+                            if current_color['bright'] and not block_color['bright']:
+                                codes.append('0')
+                                reset = True
+                            elif not current_color['bright'] and block_color['bright']:
+                                codes.append('1')
+
+                        if not block_color['fg'] == current_color['fg'] or reset:
+                            fg_color = block_color['fg']
+                            fg_color -= block_color['bright']*8
+                            codes.append('3{}'.format(fg_color))
+
+                        if not block_color['bg'] == current_color['bg'] or reset:
+                            codes.append('4{}'.format(block_color['bg']))
+
+                        if block_color['fg'] == 7 and block_color['bg'] == 0:
+                            result.append('0m')
+                        else:
+                            result.append('{}m'.format(';'.join(codes)))
+
+                        current_color = block_color
+
+                c = block.c
+
+                if c == 0:
+                    c = 32
+                    
+                if utf8:
+                    c = unichr(ansi.utf8[c])
+                else:
+                    c = chr(c)
+
+                result.append(c)
+
+            result.append('\n')
 
         return ''.join(result)
 
@@ -225,10 +292,8 @@ class VT100Screen(object):
                             ,background=ansi.colors[0]
                             ,compression=9) # 'cause why not?
         
-        # the goal here is to fill in the blanks, so this is sort of linke the dump-to-string algorithm
+        # the goal here is to fill in the blanks, so this is sort of like the dump-to-string algorithm
         result = list()
-        current_color = {'fg': 7, 'bg': 0}
-
         image_data = list()
 
         for row in xrange(end):
@@ -239,26 +304,29 @@ class VT100Screen(object):
 
             for col in xrange(self.width):
                 if not col in self.drawbuffer[row]:
+                    #cp437.debug('PNG drawing null-block at {}, {}', col, row)
                     # TODO: swap this out for magical custom background one day
                     block = VT100Block(c=0
                                        ,fg=7
                                        ,bg=0)
                 else:
                     block = self.drawbuffer[row][col]
-                    current_color['fg'] = block.fg
-                    current_color['bg'] = block.bg
-
+                    #cp437.debug('PNG drawing {} at {}, {}', repr(block), col, row)
+                    
+                current_color = {'fg': block.fg, 'bg': block.bg}
                 pixel_map = ansi.charset[block.c]
+
+                #cp437.debug('PNG converting {} into pixels', repr(block))
 
                 for y in xrange(16):
                     for x in xrange(self.spacing):
                         pix = pixel_map[y][x]
-                        color = ('bg', 'fg')[pixel_map[y][x]]
-                        pixel = ansi.colors[current_color[color]]
-
+                        color = ('bg', 'fg')[pix]
+                        pixel = self.palette.get(current_color[color])
+                      
                         for c in pixel:
                             row_data[y].append(c)
-
+                                    
             for subrow in row_data:
                 image_data.append(subrow)
 
@@ -299,6 +367,9 @@ class CursorShiftEvent(VT100Event):
     LEFT = 'D'
 
     def __call__(self, direction, shift):
+        cp437.debug_event('cursor shift event: {} by {}'.format({'A': 'up', 'B': 'down', 'C': 'right', 'D': 'left'}[direction]
+                                                          ,shift))
+
         if not direction in 'ABCD':
             raise ValueError('direction must be one of CursorShiftEvent.{UP,DOWN,RIGHT,LEFT}')
 
@@ -331,10 +402,16 @@ class CursorShiftEvent(VT100Event):
         elif direction == 'D':
             self.screen.dX = max(0, self.screen.dX - shift)
 
+        self.screen.check_eol()
+
+        cp437.debug_state('screen state is now: dX: {} / dY: {}', self.screen.dX, self.screen.dY)
+
 class VT100Parser(object):
     EVENT_TABLE = None
 
     def __init__(self, *args, **kwargs):
+        self.stream = None
+
         if not 'file' in kwargs and not 'filename' in kwargs and not 'stream' in kwargs:
             raise ValueError('no file, filename or stream present')
 
@@ -346,6 +423,9 @@ class VT100Parser(object):
             
         if 'file' in kwargs:
             self.stream = kwargs['file'].read()
+
+        if 'stream' in kwargs and not self.stream:
+            self.stream = kwargs['stream']
 
         self.event_table = kwargs.setdefault('event_table', self.EVENT_TABLE)
 
@@ -379,15 +459,36 @@ class VT100Parser(object):
         sauce = self.stream[-129:]
 
         if sauce[:6] == '\x1aSAUCE':
+            cp437.debug_event('found Pablo sauce')
             self.stream = self.stream[:-129]
+
+        sauce = self.stream[-132:]
+
+        if sauce[:9] == '\x1a\x00\x00\x00SAUCE':
+            cp437.debug_event('found Pablo sauce (variant)')
+            self.stream = self.stream[:-132]
+
+        # no idea what this is but okay
+        comnt = self.stream[-201:]
+
+        if comnt[:9] == '\x1a\x00\x00\x00COMNT':
+            cp437.debug_event('found COMNT block')
+            self.stream = self.stream[:-201]
+
+        states = ['print', 'esc', 'bracket', 'paren', 'pound', 'numeric', 'alpha', 'alnum']
 
         while tape_index < len(self.stream):
             c = self.stream[tape_index]
+
+            cp437.debug_state('tape index: {} / state: {} / byte: {}'.format(tape_index
+                                                                       ,states[state]
+                                                                       ,ord(c)))
 
             if state == print_state:
                 tape_index += 1
 
                 if c == '\x1B':
+                    cp437.debug_state('found vt100 escape')
                     state = esc_state
                     continue
                     
@@ -410,9 +511,11 @@ class VT100Parser(object):
                     state = alnum_state
             elif state == bracket_state: # escape sequence starts with an open bracket
                 static_sequences = {
+                    '[7h': UnknownEvent,
                     '[20h': UnknownEvent,
                     '[?1h': UnknownEvent,
                     '[?3h': UnknownEvent,
+                    '[?33h': UnknownEvent,
                     '[?4h': UnknownEvent,
                     '[?5h': UnknownEvent,
                     '[?6h': UnknownEvent,
@@ -456,6 +559,8 @@ class VT100Parser(object):
                     sliced = self.stream[peek_index:peek_index+1+i]
 
                     if sliced in static_sequences:
+                        cp437.debug_state('found sequence: {}'.format(sliced))
+
                         event = self.get_event(static_sequences[sliced], screen)
                         event()
 
@@ -494,31 +599,43 @@ class VT100Parser(object):
 
                 state = print_state
 
+                cp437.debug_state('control codes: {} / command: {}', numerics, c)
+
                 if c == 'm':
                     # do the things
+                    # TODO: convert these into events
                     for n in numerics:
                         if n >= 90 and n <= 97 or n >= 100 and n <= 107:
+                            cp437.debug_event('screen brightness triggered (high value)')
                             screen.bright = True
                             n -= 60
 
                         if n == 0:
+                            cp437.debug_event('screen attributes reset')
                             screen.reset_attributes()
                         elif n == 1:
+                            cp437.debug_event('screen brightness triggered')
                             screen.bright = True
                         elif n == 2:
-                            print 'dim!'
+                            cp437.debug_event('screen brightness removed')
                             screen.bright = False
                         elif n == 4:
+                            cp437.debug_event('underscore triggered')
                             screen.underscore = True
                         elif n == 5:
+                            cp437.debug_event('blink triggered')
                             screen.blink = False
                         elif n == 7:
+                            cp437.debug_event('screen reversal triggered')
                             screen.reverse = True
                         elif n == 8:
+                            cp437.debug_event('hidden blocks triggered')
                             screen.hidden = True
                         elif n >= 30 and n <= 37:
+                            cp437.debug_event('foreground: {}',n-30)
                             screen.fg = ansi.vga[n]
                         elif n >= 40 and n <= 47:
+                            cp437.debug_event('background: {}',n-40)
                             screen.bg = ansi.vga[n]
 
                     if len(numerics) == 0:
@@ -542,7 +659,7 @@ class VT100Parser(object):
                     event(c, shift)
                     tape_index = peek_index
                 else:
-                    sys.stderr.write('found terminator: {} (numerics: {})\n'.format(c, numerics))
+                    cp437.debug_state('found terminator: {} (numerics: {})\n', c, numerics)
                     event = self.get_event(UnknownEvent, screen)
                     event()
             else:
